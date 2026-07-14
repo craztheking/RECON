@@ -1,0 +1,12 @@
+{
+  "name": "steel-salvo-server",
+  "version": "1.0.0",
+  "description": "Relay server + static host for STEEL SALVO top-down combined arms game",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

@@ -1,0 +1,158 @@
+/* STEEL SALVO relay server
+   - serves steel-salvo.html at "/"
+   - room-based WebSocket relay; first client in a room is the host
+   - host -> {t:'state'} broadcast to peers; peers -> {t:'to_host'} forwarded to host
+   Deploy: Railway/any Node host. PORT env respected. */
+'use strict';
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const { WebSocketServer } = require('ws');
+
+const PORT = process.env.PORT || 8080;
+const HTML = path.join(__dirname, 'steel-salvo.html');
+
+// PWA / app-install static files served from this folder
+const STATIC = {
+  '/manifest.webmanifest': ['manifest.webmanifest', 'application/manifest+json'],
+  '/sw.js': ['sw.js', 'text/javascript; charset=utf-8'],
+  '/icon-192.png': ['icon-192.png', 'image/png'],
+  '/icon-512.png': ['icon-512.png', 'image/png'],
+  '/icon-maskable-512.png': ['icon-maskable-512.png', 'image/png'],
+  '/apple-touch-icon.png': ['apple-touch-icon.png', 'image/png'],
+};
+
+const server = http.createServer((req, res) => {
+  const url = (req.url || '/').split('?')[0];
+  if (url === '/' || url === '/index.html') {
+    fs.readFile(HTML, (err, data) => {
+      if (err) { res.writeHead(500); res.end('client file missing'); return; }
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(data);
+    });
+  } else if (STATIC[url]) {
+    const [file, type] = STATIC[url];
+    fs.readFile(path.join(__dirname, file), (err, data) => {
+      if (err) { res.writeHead(404); res.end(); return; }
+      const headers = { 'Content-Type': type };
+      if (url === '/sw.js') headers['Service-Worker-Allowed'] = '/';
+      res.writeHead(200, headers);
+      res.end(data);
+    });
+  } else if (url === '/health') {
+    res.writeHead(200); res.end('ok');
+  } else { res.writeHead(404); res.end(); }
+});
+
+const wss = new WebSocketServer({ server, maxPayload: 256 * 1024 });
+const rooms = new Map(); // code -> { host: ws, clients: Map<id, ws> }
+let nextId = 1;
+
+const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+function makeCode() {
+  let c;
+  do { c = Array.from({ length: 4 }, () => CODE_CHARS[(Math.random() * CODE_CHARS.length) | 0]).join(''); }
+  while (rooms.has(c));
+  return c;
+}
+function send(ws, o) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); }
+function peersOf(room, exceptId) {
+  const out = {};
+  for (const [id, ws] of room.clients) if (id !== exceptId && ws !== room.host) out[id] = ws._name;
+  return out;
+}
+
+wss.on('connection', (ws) => {
+  ws._id = nextId++;
+  ws._room = null;
+  ws._alive = true;
+  ws.on('pong', () => { ws._alive = true; });
+
+  ws.on('message', (raw) => {
+    let m; try { m = JSON.parse(raw); } catch (e) { return; }
+    const room = ws._room ? rooms.get(ws._room) : null;
+
+    switch (m.t) {
+      case 'host': {
+        const code = makeCode();
+        ws._name = String(m.name || 'HOST').slice(0, 14);
+        const r = { host: ws, clients: new Map([[ws._id, ws]]), public: !!m.public, mode: String(m.mode || 'tdm').slice(0, 8), hostName: ws._name, crossplay: !!m.crossplay, device: m.device === 'mobile' ? 'mobile' : 'desktop' };
+        rooms.set(code, r); ws._room = code;
+        send(ws, { t: 'hosted', room: code, id: ws._id });
+        break;
+      }
+      case 'list': {
+        const list = [];
+        for (const [code, r] of rooms) {
+          if (r.public && r.clients.size < 12) list.push({ code, host: r.hostName || 'HOST', players: r.clients.size, cap: 12, mode: r.mode || 'tdm', device: r.device || 'desktop', cross: !!r.crossplay });
+        }
+        send(ws, { t: 'rooms', rooms: list.slice(0, 50) });
+        break;
+      }
+      case 'join': {
+        const code = String(m.room || '').toUpperCase();
+        const r = rooms.get(code);
+        if (!r) { send(ws, { t: 'room_closed' }); break; }
+        if (r.clients.size >= 12) { send(ws, { t: 'room_closed' }); break; }
+        const jdev = m.device === 'mobile' ? 'mobile' : 'desktop';
+        if (!r.crossplay && jdev !== r.device) { send(ws, { t: 'join_denied', reason: 'crossplay', device: r.device }); break; }
+        ws._name = String(m.name || 'PLAYER').slice(0, 14);
+        r.clients.set(ws._id, ws); ws._room = code;
+        send(ws, { t: 'joined', room: code, id: ws._id });
+        send(ws, { t: 'peers', peers: peersOf(r, ws._id) });
+        send(r.host, { t: 'peer_join', id: ws._id, name: ws._name });
+        for (const [, c] of r.clients) if (c !== ws && c !== r.host) send(c, { t: 'peer_join', id: ws._id, name: ws._name });
+        break;
+      }
+      case 'state': { // host -> all peers
+        if (!room || room.host !== ws) break;
+        const msg = JSON.stringify({ t: 'relay', from: ws._id, d: m.d });
+        for (const [, c] of room.clients) if (c !== ws && c.readyState === 1) c.send(msg);
+        break;
+      }
+      case 'to_host': { // peer -> host
+        if (!room) break;
+        send(room.host, { t: 'relay', from: ws._id, d: m.d });
+        break;
+      }
+      case 'to': { // host -> one peer
+        if (!room || room.host !== ws) break;
+        const c = room.clients.get(m.id);
+        if (c) send(c, { t: 'relay', from: ws._id, d: m.d });
+        break;
+      }
+    }
+  });
+
+  ws.on('close', () => {
+    const room = ws._room ? rooms.get(ws._room) : null;
+    if (!room) return;
+    room.clients.delete(ws._id);
+    if (room.host === ws) {
+      // host migration: promote the earliest-joined remaining client
+      const rest = [...room.clients.values()].filter(c => c.readyState === 1);
+      if (rest.length) {
+        const nh = rest[0];
+        room.host = nh;
+        room.hostName = nh._name;
+        send(nh, { t: 'you_are_host', gone: ws._id });
+        for (const c of rest) if (c !== nh) send(c, { t: 'host_changed', name: nh._name });
+        // refresh everyone's peer list relative to the new host
+        for (const c of rest) send(c, { t: 'peers', peers: peersOf(room, c._id) });
+      } else {
+        rooms.delete(ws._room);
+      }
+    } else {
+      for (const [, c] of room.clients) send(c, { t: 'peer_leave', id: ws._id });
+    }
+  });
+});
+
+setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (!ws._alive) return ws.terminate();
+    ws._alive = false; ws.ping();
+  });
+}, 30000);
+
+server.listen(PORT, () => console.log('STEEL SALVO relay on :' + PORT));
